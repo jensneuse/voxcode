@@ -12,11 +12,11 @@ echo
 # ---------------------------------------------------------------------------
 # 1. ONNX Runtime dylib (macOS arm64)
 #
-# Use a locally installed Homebrew build because the GitHub release does not
-# publish the macOS dylib asset we need, and the PyPI wheel variant hangs
-# during `ort::init_from()` in this app's bootstrap smoke test.
+# Download the official GitHub release tarball.  The release build is fully
+# self-contained (only macOS system frameworks) — no Homebrew transitive deps.
 # ---------------------------------------------------------------------------
 
+ORT_VERSION="1.24.3"
 ORT_DYLIB="$RESOURCE_DIR/libonnxruntime.dylib"
 
 is_loadable_ort_dylib() {
@@ -42,24 +42,29 @@ else
         rm -f "$ORT_DYLIB"
     fi
 
-    ORT_SOURCE_DYLIB=""
-    for candidate in \
-        /opt/homebrew/lib/libonnxruntime.dylib \
-        /usr/local/lib/libonnxruntime.dylib
-    do
-        if [ -s "$candidate" ] && is_loadable_ort_dylib "$candidate"; then
-            ORT_SOURCE_DYLIB="$candidate"
-            break
-        fi
-    done
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        arm64) ORT_ARCH="arm64" ;;
+        x86_64) ORT_ARCH="x86_64" ;;
+        *) echo "ERROR: Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
 
-    if [ -z "$ORT_SOURCE_DYLIB" ]; then
-        echo "ERROR: Could not find a loadable local ONNX Runtime dylib."
-        echo "Install it with Homebrew first: brew install onnxruntime"
+    ORT_TARBALL="onnxruntime-osx-${ORT_ARCH}-${ORT_VERSION}.tgz"
+    ORT_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TARBALL}"
+    ORT_TMPDIR="$(mktemp -d)"
+
+    echo "Downloading ONNX Runtime v${ORT_VERSION} (${ORT_ARCH})..."
+    curl -L --progress-bar "$ORT_URL" | tar xz -C "$ORT_TMPDIR"
+
+    cp "$ORT_TMPDIR/onnxruntime-osx-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.dylib" "$ORT_DYLIB"
+    rm -rf "$ORT_TMPDIR"
+
+    if ! is_loadable_ort_dylib "$ORT_DYLIB"; then
+        echo "ERROR: Downloaded dylib is not loadable"
+        rm -f "$ORT_DYLIB"
         exit 1
     fi
 
-    cp "$ORT_SOURCE_DYLIB" "$ORT_DYLIB"
     echo "  -> $ORT_DYLIB"
 fi
 
