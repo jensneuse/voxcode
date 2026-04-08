@@ -17,6 +17,14 @@ Add an env var ORT_INTRA_THREADS to make the thread count configurable, default 
 
 ![Voxcode demo — select code, speak, paste](voxcode.gif)
 
+## Quickstart
+
+```bash
+git clone https://github.com/jensneuse/voxcode.git
+cd voxcode
+make run
+```
+
 ## How It Works
 
 1. **Select code** in your editor
