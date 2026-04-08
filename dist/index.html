@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxcode</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <div class="pill" id="pill">
+            <div class="pill-row" id="pill-row">
+                <div class="waveform" id="waveform"></div>
+                <div class="controls" id="controls">
+                    <button class="btn btn-stop" id="btn-stop">Stop</button>
+                    <button class="btn btn-cancel" id="btn-cancel">Cancel</button>
+                </div>
+            </div>
+            <div class="processing" id="processing">
+                <div class="spinner"></div>
+                <span class="processing-text">Transcribing...</span>
+            </div>
+            <div class="transcript" id="transcript">
+                <div class="resolving-indicator" id="resolving-indicator">
+                    <div class="resolving-dot"></div>
+                    <div class="resolving-dot"></div>
+                    <div class="resolving-dot"></div>
+                </div>
+                <div class="transcript-reference" id="transcript-reference"></div>
+                <div class="resolve-timing" id="resolve-timing"></div>
+            </div>
+        </div>
+    </div>
+    <script src="transcript_state.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>

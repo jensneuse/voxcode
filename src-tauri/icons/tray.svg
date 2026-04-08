@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">
+  <!-- Tray template icon: mic with code-bracket cradle, black on transparent -->
+  <!-- macOS auto-tints for dark/light mode when iconAsTemplate=true -->
+
+  <!-- Mic capsule -->
+  <rect x="17" y="4" width="10" height="17" rx="5" ry="5" fill="black"/>
+
+  <!-- Left angle bracket < (cradle) -->
+  <path d="M 15 13 L 8 22 L 15 31"
+        fill="none" stroke="black" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Right angle bracket > (cradle) -->
+  <path d="M 29 13 L 36 22 L 29 31"
+        fill="none" stroke="black" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Stem -->
+  <line x1="22" y1="31" x2="22" y2="36" stroke="black" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Base -->
+  <line x1="16" y1="36" x2="28" y2="36" stroke="black" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

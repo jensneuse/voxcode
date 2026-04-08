@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"","local":true,"windows":["pill"],"permissions":["core:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-position","core:event:default"]}}

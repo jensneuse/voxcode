@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Create placeholder resources for build
+        working-directory: src-tauri
+        run: |
+          mkdir -p resources/models/parakeet-tdt-0.6b-v2
+          touch resources/libonnxruntime.dylib
+          touch resources/models/parakeet-tdt-0.6b-v2/encoder-model.onnx
+          touch resources/models/parakeet-tdt-0.6b-v2/encoder-model.onnx.data
+          touch resources/models/parakeet-tdt-0.6b-v2/decoder_joint-model.onnx
+          touch resources/models/parakeet-tdt-0.6b-v2/nemo128.onnx
+          touch resources/models/parakeet-tdt-0.6b-v2/vocab.txt
+
+      - name: Run tests
+        working-directory: src-tauri
+        env:
+          SKIP_REAL_ORT_INIT: "1"
+        run: cargo test -- --test-threads=1

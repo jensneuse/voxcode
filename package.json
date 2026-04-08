@@ -1,0 +1,9 @@
+{
+  "name": "voxcode",
+  "version": "0.1.0",
+  "description": "Voice-to-paste for AI coding agents. Local speech-to-text with editor context for any IDE and any coding tool.",
+  "private": true,
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

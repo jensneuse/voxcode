@@ -1,0 +1,36 @@
+[package]
+name = "voxcode"
+version = "0.1.0"
+edition = "2021"
+default-run = "voxcode"
+description = "Voice-to-paste for AI coding agents. Local speech-to-text with editor context for any IDE and any coding tool."
+license = "MIT"
+repository = "https://github.com/jensneuse/voxcode"
+keywords = ["voice-to-text", "speech-to-text", "ai-coding", "tauri", "onnx"]
+categories = ["multimedia::audio", "development-tools"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+cpal = "0.15"
+rubato = "0.16"
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+arboard = "3"
+dirs = "6"
+walkdir = "2"
+transcribe-rs = { version = "0.3.8", features = ["onnx"] }
+memchr = "2"
+ignore = "0.4"
+notify = { version = "8.2.0", features = ["macos_fsevent"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+arboard = "3"
