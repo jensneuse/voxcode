@@ -150,7 +150,250 @@ fn finish_processing_as_idle(
         let mut state = state_guard.lock().unwrap();
         state.recording_state = state::RecordingState::Idle;
     }
+    let is_recording = app.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+    is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = app.emit("recording-state", state::RecordingState::Idle);
+}
+
+fn start_recording(handle: &tauri::AppHandle) {
+    let state = handle.state::<std::sync::Mutex<state::AppState>>();
+    let current_state = state.lock().unwrap().recording_state;
+    if current_state != state::RecordingState::Idle {
+        log::debug!("Ignoring start — not idle (state={:?})", current_state);
+        return;
+    }
+
+    let mut s = state.lock().unwrap();
+    if s.last_recording_start.elapsed().as_millis() < 300 {
+        log::debug!("Ignoring start — debounce");
+        return;
+    }
+    s.recording_state = state::RecordingState::Recording;
+    s.last_recording_start = std::time::Instant::now();
+    #[cfg(target_os = "macos")]
+    {
+        s.previous_app_pid = window_ext::get_frontmost_app_pid();
+        log::info!("Saved previous app PID: {:?}", s.previous_app_pid);
+    }
+    let capture_pid = s.previous_app_pid;
+    drop(s);
+
+    // Set is_recording flag for hotkey callback
+    let is_recording = handle.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+    is_recording.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let raw_capture = capture_pid.and_then(editor_context::capture_editor_raw);
+    let has_selected_text = raw_capture.as_ref()
+        .map(|r| !r.selected_text.is_empty())
+        .unwrap_or(false);
+    let editor_resolve_rx = raw_capture.map(|raw| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let ctx = editor_context::resolve_editor_context(raw);
+            let _ = tx.send(ctx);
+        });
+        rx
+    });
+
+    let mut s = state.lock().unwrap();
+    if s.recording_state != state::RecordingState::Recording {
+        return;
+    }
+    s.session_id += 1;
+    let current_session_id = s.session_id;
+    let monitor_idx = s.selected_monitor;
+    log::info!("Recording started (monitor {})", monitor_idx);
+    #[cfg(target_os = "macos")]
+    window_ext::play_system_sound("Tink");
+    position_pill_on_monitor(handle, monitor_idx);
+    if let Some(window) = handle.get_webview_window("pill") {
+        let _ = window.show();
+    }
+
+    let session_state = handle
+        .state::<std::sync::Arc<state::SessionState>>()
+        .inner()
+        .clone();
+    session_state.begin_session();
+    let (accum_tx, accum_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    *session_state.accum_chunk_sender.lock().unwrap() = Some(accum_tx);
+    let accum_join = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        while let Ok(chunk) = accum_rx.recv() {
+            buffer.extend_from_slice(&chunk);
+        }
+        buffer
+    });
+    *session_state.accum_handle.lock().unwrap() = Some(accum_join);
+    let _ = handle.emit("recording-state", s.recording_state);
+    if has_selected_text {
+        let _ = handle.emit("resolving-context", serde_json::json!({
+            "session_id": s.session_id,
+        }));
+    }
+
+    let resolve_start = std::time::Instant::now();
+    let handle_clone = handle.clone();
+    let session_for_async = session_state.clone();
+    tauri::async_runtime::spawn(async move {
+        let editor_context = editor_resolve_rx.and_then(|rx| {
+            rx.recv_timeout(std::time::Duration::from_secs(30)).ok()
+        });
+        let resolve_ms = resolve_start.elapsed().as_millis();
+        if let Some(ref editor_context) = editor_context {
+            let reference = editor_context.format_markdown_reference();
+            if !reference.is_empty() {
+                session_for_async.set_reference_text(&reference);
+                emit_reference_text(
+                    &handle_clone,
+                    current_session_id,
+                    &reference,
+                    resolve_ms as u64,
+                );
+            }
+        }
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let state_guard = handle_clone.state::<std::sync::Mutex<state::AppState>>();
+            if state_guard.lock().unwrap().recording_state != state::RecordingState::Recording {
+                break;
+            }
+        }
+
+        let state_guard = handle_clone.state::<std::sync::Mutex<state::AppState>>();
+        if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
+            return;
+        }
+
+        // Join audio threads
+        let session = handle_clone.state::<std::sync::Arc<state::SessionState>>();
+        let capture_handle = session.worker_handle.lock().unwrap().take();
+        if let Some(handle) = capture_handle {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+        }
+        let amplitude_bridge_handle =
+            session.amplitude_bridge_handle.lock().unwrap().take();
+        if let Some(handle) = amplitude_bridge_handle {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+        }
+
+        // Join the accumulator thread to get the full audio buffer
+        let audio_buffer = {
+            let accum_handle = session.accum_handle.lock().unwrap().take();
+            if let Some(handle) = accum_handle {
+                tokio::task::spawn_blocking(move || handle.join().unwrap_or_default())
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+
+        if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
+            log::info!("Transcription cancelled by user, discarding result");
+            return;
+        }
+
+        // Run Parakeet final-pass transcription
+        let transcript = if audio_buffer.is_empty() {
+            log::info!("Empty audio buffer, nothing to transcribe");
+            String::new()
+        } else {
+            log::info!(
+                "Running Parakeet final pass on {:.1}s of audio",
+                audio_buffer.len() as f64 / 16_000.0
+            );
+            match tokio::task::spawn_blocking(move || {
+                crate::parakeet::transcribe(&audio_buffer)
+            })
+            .await
+            {
+                Ok(Ok(text)) => {
+                    log::debug!("Parakeet transcript: {text}");
+                    text
+                }
+                Ok(Err(e)) => {
+                    log::error!("Parakeet transcription failed: {e}");
+                    String::new()
+                }
+                Err(e) => {
+                    log::error!("Parakeet task panicked: {e}");
+                    String::new()
+                }
+            }
+        };
+        log::debug!("Final transcript: {}", transcript);
+        if transcript.trim().is_empty() && editor_context.is_none() {
+            log::info!("Empty transcript, no editor context, nothing to paste");
+        } else {
+            if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
+                log::info!("Cancelled before paste, discarding");
+                return;
+            }
+
+            let paste_text = if let Some(ref editor_context) = editor_context {
+                editor_context.format_with_transcript(&transcript)
+            } else {
+                transcript.clone()
+            };
+
+            {
+                let s = state_guard.lock().unwrap();
+                if s.recording_state != state::RecordingState::Processing {
+                    log::info!("Cancelled before output, discarding");
+                    return;
+                }
+            }
+
+            if let Some(window) = handle_clone.get_webview_window("pill") {
+                let _ = window.hide();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            #[cfg(target_os = "macos")]
+            {
+                let previous_pid = state_guard.lock().unwrap().previous_app_pid;
+                if let Some(pid) = previous_pid {
+                    window_ext::reactivate_app_by_pid(pid);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            if let Err(e) = paste::paste_text(&paste_text) {
+                log::error!("Paste error: {}", e);
+            }
+
+            {
+                let mut s = state_guard.lock().unwrap();
+                s.push_transcript_history(paste_text);
+            }
+            rebuild_tray_menu(&handle_clone);
+        }
+
+        finish_processing_as_idle(&handle_clone, &state_guard);
+    });
+}
+
+fn stop_recording(handle: &tauri::AppHandle) {
+    let state = handle.state::<std::sync::Mutex<state::AppState>>();
+    let current_state = state.lock().unwrap().recording_state;
+    if current_state != state::RecordingState::Recording {
+        log::debug!("Ignoring stop — not recording (state={:?})", current_state);
+        return;
+    }
+    let mut s = state.lock().unwrap();
+    s.recording_state = state::RecordingState::Processing;
+    log::info!("Recording stopped, processing...");
+    #[cfg(target_os = "macos")]
+    window_ext::play_system_sound("Pop");
+    let session = handle.state::<std::sync::Arc<state::SessionState>>();
+    session.signal_stop();
+    drop_accumulator_sender(handle);
+    let _ = handle.emit("recording-state", s.recording_state);
+
+    // Clear is_recording flag
+    let is_recording = handle.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+    is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn emit_reference_text(
@@ -181,6 +424,8 @@ fn stop(
         s.recording_state = state::RecordingState::Processing;
         session.signal_stop();
         drop_accumulator_sender(&app);
+        let is_recording = app.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+        is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = app.emit("recording-state", s.recording_state);
     }
     Ok(())
@@ -205,6 +450,8 @@ fn cancel(
         if let Some(window) = app.get_webview_window("pill") {
             let _ = window.hide();
         }
+        let is_recording = app.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+        is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = app.emit("recording-state", s.recording_state);
     }
     Ok(())
@@ -377,10 +624,14 @@ pub fn run() {
                 }
                 Err(e) => log::warn!("FS watcher failed to start: {}", e),
             }
+            // Shared flag so hotkey callback knows when recording is active
+            let is_recording = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            app.manage(is_recording.clone());
+
             // Start global hotkey listener
             let app_handle = app.handle().clone();
             let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            hotkey::start_hotkey_listener(app_handle, stop_signal.clone());
+            hotkey::start_hotkey_listener(app_handle, stop_signal.clone(), is_recording);
 
             // Handle hotkey-toggle: cycle Idle -> Recording -> Processing
             let handle = app.handle().clone();
@@ -388,224 +639,8 @@ pub fn run() {
                 let state = handle.state::<std::sync::Mutex<state::AppState>>();
                 let current_state = state.lock().unwrap().recording_state;
                 match current_state {
-                    state::RecordingState::Idle => {
-                        let mut s = state.lock().unwrap();
-                        if s.last_recording_start.elapsed().as_millis() < 300 {
-                            log::debug!("Ignoring start — debounce");
-                            return;
-                        }
-                        s.recording_state = state::RecordingState::Recording;
-                        s.last_recording_start = std::time::Instant::now();
-                        #[cfg(target_os = "macos")]
-                        {
-                            s.previous_app_pid = window_ext::get_frontmost_app_pid();
-                            log::info!("Saved previous app PID: {:?}", s.previous_app_pid);
-                        }
-                        let capture_pid = s.previous_app_pid;
-                        drop(s);
-
-                        let raw_capture = capture_pid.and_then(editor_context::capture_editor_raw);
-                        let has_selected_text = raw_capture.as_ref()
-                            .map(|r| !r.selected_text.is_empty())
-                            .unwrap_or(false);
-                        let editor_resolve_rx = raw_capture.map(|raw| {
-                            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                            std::thread::spawn(move || {
-                                let ctx = editor_context::resolve_editor_context(raw);
-                                let _ = tx.send(ctx);
-                            });
-                            rx
-                        });
-
-                        let mut s = state.lock().unwrap();
-                        if s.recording_state != state::RecordingState::Recording {
-                            return;
-                        }
-                        s.session_id += 1;
-                        let current_session_id = s.session_id;
-                        let monitor_idx = s.selected_monitor;
-                        log::info!("Recording started (monitor {})", monitor_idx);
-                        #[cfg(target_os = "macos")]
-                        window_ext::play_system_sound("Tink");
-                        position_pill_on_monitor(&handle, monitor_idx);
-                        if let Some(window) = handle.get_webview_window("pill") {
-                            let _ = window.show();
-                        }
-
-                        let session_state = handle
-                            .state::<std::sync::Arc<state::SessionState>>()
-                            .inner()
-                            .clone();
-                        session_state.begin_session();
-                        let (accum_tx, accum_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-                        *session_state.accum_chunk_sender.lock().unwrap() = Some(accum_tx);
-                        let accum_join = std::thread::spawn(move || {
-                            let mut buffer = Vec::new();
-                            while let Ok(chunk) = accum_rx.recv() {
-                                buffer.extend_from_slice(&chunk);
-                            }
-                            buffer
-                        });
-                        *session_state.accum_handle.lock().unwrap() = Some(accum_join);
-                        let _ = handle.emit("recording-state", s.recording_state);
-                        if has_selected_text {
-                            let _ = handle.emit("resolving-context", serde_json::json!({
-                                "session_id": s.session_id,
-                            }));
-                        }
-
-                        let resolve_start = std::time::Instant::now();
-                        let handle_clone = handle.clone();
-                        let session_for_async = session_state.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let editor_context = editor_resolve_rx.and_then(|rx| {
-                                rx.recv_timeout(std::time::Duration::from_secs(30)).ok()
-                            });
-                            let resolve_ms = resolve_start.elapsed().as_millis();
-                            if let Some(ref editor_context) = editor_context {
-                                let reference = editor_context.format_markdown_reference();
-                                if !reference.is_empty() {
-                                    session_for_async.set_reference_text(&reference);
-                                    emit_reference_text(
-                                        &handle_clone,
-                                        current_session_id,
-                                        &reference,
-                                        resolve_ms as u64,
-                                    );
-                                }
-                            }
-
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                let state_guard = handle_clone.state::<std::sync::Mutex<state::AppState>>();
-                                if state_guard.lock().unwrap().recording_state != state::RecordingState::Recording {
-                                    break;
-                                }
-                            }
-
-                            let state_guard = handle_clone.state::<std::sync::Mutex<state::AppState>>();
-                            if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
-                                return;
-                            }
-
-                            // Join audio threads
-                            let session = handle_clone.state::<std::sync::Arc<state::SessionState>>();
-                            let capture_handle = session.worker_handle.lock().unwrap().take();
-                            if let Some(handle) = capture_handle {
-                                let _ = tokio::task::spawn_blocking(move || handle.join()).await;
-                            }
-                            let amplitude_bridge_handle =
-                                session.amplitude_bridge_handle.lock().unwrap().take();
-                            if let Some(handle) = amplitude_bridge_handle {
-                                let _ = tokio::task::spawn_blocking(move || handle.join()).await;
-                            }
-
-                            // Join the accumulator thread to get the full audio buffer
-                            let audio_buffer = {
-                                let accum_handle = session.accum_handle.lock().unwrap().take();
-                                if let Some(handle) = accum_handle {
-                                    tokio::task::spawn_blocking(move || handle.join().unwrap_or_default())
-                                        .await
-                                        .unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                }
-                            };
-
-                            if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
-                                log::info!("Transcription cancelled by user, discarding result");
-                                return;
-                            }
-
-                            // Run Parakeet final-pass transcription
-                            let transcript = if audio_buffer.is_empty() {
-                                log::info!("Empty audio buffer, nothing to transcribe");
-                                String::new()
-                            } else {
-                                log::info!(
-                                    "Running Parakeet final pass on {:.1}s of audio",
-                                    audio_buffer.len() as f64 / 16_000.0
-                                );
-                                match tokio::task::spawn_blocking(move || {
-                                    crate::parakeet::transcribe(&audio_buffer)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(text)) => {
-                                        log::debug!("Parakeet transcript: {text}");
-                                        text
-                                    }
-                                    Ok(Err(e)) => {
-                                        log::error!("Parakeet transcription failed: {e}");
-                                        String::new()
-                                    }
-                                    Err(e) => {
-                                        log::error!("Parakeet task panicked: {e}");
-                                        String::new()
-                                    }
-                                }
-                            };
-                            log::debug!("Final transcript: {}", transcript);
-                            if transcript.trim().is_empty() && editor_context.is_none() {
-                                log::info!("Empty transcript, no editor context, nothing to paste");
-                            } else {
-                                if state_guard.lock().unwrap().recording_state != state::RecordingState::Processing {
-                                    log::info!("Cancelled before paste, discarding");
-                                    return;
-                                }
-
-                                let paste_text = if let Some(ref editor_context) = editor_context {
-                                    editor_context.format_with_transcript(&transcript)
-                                } else {
-                                    transcript.clone()
-                                };
-
-                                {
-                                    let s = state_guard.lock().unwrap();
-                                    if s.recording_state != state::RecordingState::Processing {
-                                        log::info!("Cancelled before output, discarding");
-                                        return;
-                                    }
-                                }
-
-                                if let Some(window) = handle_clone.get_webview_window("pill") {
-                                    let _ = window.hide();
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                                #[cfg(target_os = "macos")]
-                                {
-                                    let previous_pid = state_guard.lock().unwrap().previous_app_pid;
-                                    if let Some(pid) = previous_pid {
-                                        window_ext::reactivate_app_by_pid(pid);
-                                    }
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-
-                                if let Err(e) = paste::paste_text(&paste_text) {
-                                    log::error!("Paste error: {}", e);
-                                }
-
-                                {
-                                    let mut s = state_guard.lock().unwrap();
-                                    s.push_transcript_history(paste_text);
-                                }
-                                rebuild_tray_menu(&handle_clone);
-                            }
-
-                            finish_processing_as_idle(&handle_clone, &state_guard);
-                        });
-                    }
-                    state::RecordingState::Recording => {
-                        let mut s = state.lock().unwrap();
-                        s.recording_state = state::RecordingState::Processing;
-                        log::info!("Recording stopped, processing...");
-                        #[cfg(target_os = "macos")]
-                        window_ext::play_system_sound("Pop");
-                        let session = handle.state::<std::sync::Arc<state::SessionState>>();
-                        session.signal_stop();
-                        drop_accumulator_sender(&handle);
-                        let _ = handle.emit("recording-state", s.recording_state);
-                    }
+                    state::RecordingState::Idle => start_recording(&handle),
+                    state::RecordingState::Recording => stop_recording(&handle),
                     state::RecordingState::Processing => {
                         let mut s = state.lock().unwrap();
                         s.recording_state = state::RecordingState::Idle;
@@ -617,9 +652,23 @@ pub fn run() {
                         if let Some(window) = handle.get_webview_window("pill") {
                             let _ = window.hide();
                         }
+                        let is_recording = handle.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+                        is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
                         let _ = handle.emit("recording-state", s.recording_state);
                     }
                 }
+            });
+
+            // Handle hotkey-start: Cmd+Option+C voice copy
+            let handle_start = app.handle().clone();
+            app.listen("hotkey-start", move |_event| {
+                start_recording(&handle_start);
+            });
+
+            // Handle hotkey-stop: Cmd+V while recording
+            let handle_stop = app.handle().clone();
+            app.listen("hotkey-stop", move |_event| {
+                stop_recording(&handle_stop);
             });
 
             // Handle hotkey-cancel: cancel recording if active
@@ -639,6 +688,8 @@ pub fn run() {
                     let session = handle2.state::<std::sync::Arc<state::SessionState>>();
                     session.signal_cancel();
                     discard_session(&handle2);
+                    let is_recording = handle2.state::<std::sync::Arc<std::sync::atomic::AtomicBool>>();
+                    is_recording.store(false, std::sync::atomic::Ordering::Relaxed);
                     let _ = handle2.emit("recording-state", s.recording_state);
                 }
             });

@@ -32,6 +32,18 @@ make run
 3. **Speak** your instructions
 4. **Press Right Command again** — Voxcode transcribes your speech locally and pastes the result at your cursor
 
+### Voice Copy (Cmd+Option+C)
+
+Alternatively, use the copy/paste-style workflow:
+
+1. **Select code** in your editor
+2. **Cmd+Option+C** — starts recording and captures the selected code context ("voice copy")
+3. **Speak** your instructions
+4. **Move your cursor** to where you want the result
+5. **Cmd+V** — stops recording, transcribes, and pastes
+
+This keeps your mouse hand free throughout — select code, speak, position cursor, paste. The regular Right Command shortcut also continues to work.
+
 What gets pasted is your spoken instruction with the code context attached,
 so the AI agent knows exactly what code you're referring to:
 
