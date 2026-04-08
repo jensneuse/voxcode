@@ -11,10 +11,19 @@ src-tauri/src/ort_init.rs#L49-57
 Add an env var ORT_INTRA_THREADS to make the thread count configurable, default to 10
 ```
 
+> [!TIP]
+> Works with **any IDE** (VS Code, JetBrains, Zed, Xcode, Neovim, Emacs)
+> and **any AI coding tool** (Claude Code, Cursor, Copilot, Codex, OpenCode, Windsurf, Cline, Roo Code, Kilo Code, Gemini CLI, Goose, Amp, Aider — anything that accepts text input).
+
 ![Voxcode demo — select code, speak, paste](voxcode.gif)
 
-Works with **any IDE** (VS Code, JetBrains, Zed, Xcode, Neovim, Emacs)
-and **any AI coding tool** (Claude Code, Cursor, Copilot, Codex, OpenCode, Windsurf, Cline, Roo Code, Kilo Code, Gemini CLI, Goose, Amp, Aider — anything that accepts text input).
+## Quickstart
+
+```bash
+git clone https://github.com/jensneuse/voxcode.git
+cd voxcode
+make run
+```
 
 ## How It Works
 
