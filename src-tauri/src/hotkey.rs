@@ -25,6 +25,9 @@ const K_CG_EVENT_TAP_DISABLED_BY_USER: CGEventType = 0xFFFF_FFFF;
 const NX_DEVICERCMDKEYMASK: CGEventFlags = 0x0000_0010;
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x0010_0000;
 const K_VK_ESCAPE: u16 = 53;
+const K_VK_C: u16 = 8;
+const K_VK_V: u16 = 9;
+const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x0008_0000;
 const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
 type CGEventTapCallBack = extern "C" fn(
@@ -71,6 +74,7 @@ struct HotkeyContext {
     app_handle: tauri::AppHandle,
     right_cmd_was_down: bool,
     tap: CFMachPortRef,
+    is_recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 extern "C" fn event_tap_callback(
@@ -98,7 +102,31 @@ extern "C" fn event_tap_callback(
             ctx.right_cmd_was_down = right_cmd_down;
         }
         K_CG_EVENT_KEY_DOWN => {
+            let flags = unsafe { CGEventGetFlags(event) };
             let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) } as u16;
+            let cmd_down = (flags & K_CG_EVENT_FLAG_MASK_COMMAND) != 0;
+            let option_down = (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0;
+
+            // Cmd+Option+C → voice copy (start recording)
+            if cmd_down && option_down && keycode == K_VK_C {
+                log::info!("Cmd+Option+C pressed — start voice copy");
+                let _ = ctx.app_handle.emit("hotkey-start", ());
+                return event;
+            }
+
+            // Cmd+V while recording → stop and paste
+            if cmd_down && !option_down && keycode == K_VK_V
+                && ctx.is_recording.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Clear clipboard immediately so the passthrough Cmd+V
+                // (which we can't block in listen-only mode) pastes nothing.
+                // The real paste happens after transcription completes.
+                let _ = crate::paste::copy_to_clipboard("");
+                log::info!("Cmd+V pressed while recording — stop and paste");
+                let _ = ctx.app_handle.emit("hotkey-stop", ());
+                return event;
+            }
+
             if keycode == K_VK_ESCAPE {
                 log::info!("Escape pressed");
                 let _ = ctx.app_handle.emit("hotkey-cancel", ());
@@ -163,6 +191,7 @@ fn prompt_input_monitoring() -> bool {
 pub fn start_hotkey_listener(
     app_handle: tauri::AppHandle,
     stop: Arc<AtomicBool>,
+    is_recording: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("hotkey-listener".into())
@@ -190,16 +219,16 @@ pub fn start_hotkey_listener(
                 }
             }
             if !stop.load(Ordering::Relaxed) {
-                run_event_tap(app_handle, stop);
+                run_event_tap(app_handle, stop, is_recording);
             }
         })
         .expect("failed to spawn hotkey thread")
 }
 
-fn run_event_tap(app_handle: tauri::AppHandle, stop: Arc<AtomicBool>) {
+fn run_event_tap(app_handle: tauri::AppHandle, stop: Arc<AtomicBool>, is_recording: Arc<AtomicBool>) {
     let event_mask: CGEventMask = (1 << K_CG_EVENT_FLAGS_CHANGED) | (1 << K_CG_EVENT_KEY_DOWN);
     // Create context with a null tap initially; we set it after CGEventTapCreate.
-    let ctx = Box::new(HotkeyContext { app_handle, right_cmd_was_down: false, tap: std::ptr::null_mut() });
+    let ctx = Box::new(HotkeyContext { app_handle, right_cmd_was_down: false, tap: std::ptr::null_mut(), is_recording });
     let ctx_ptr = Box::into_raw(ctx);
 
     let tap = unsafe {
